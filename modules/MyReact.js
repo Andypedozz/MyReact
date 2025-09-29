@@ -1,5 +1,6 @@
 // Mini React-like con Virtual DOM (modulo)
-// Salva come MyReact.js e importa con `import { div, h1, button, useState, renderComponent } from './MyReact.js'`
+// Salva come MyReact.js e importa con
+// `import { div, h1, button, useState, renderComponent } from './MyReact.js'`
 
 // Stato corrente dell'istanza componente in fase di rendering
 let currentInstance = null;
@@ -35,20 +36,24 @@ function createVNode(tag, props, children) {
 }
 
 function createComponentVNode(fn, props, children) {
-    return { tag: fn, props: props || {}, children: children || [], isComponent: true, instance: null };
+    return { tag: fn, props: props || {}, children: children || [], isComponent: true, instance: null, rendered: null, el: null };
 }
 
 function h(tag, props, ...children) {
-    // component function
+    // funzione componente
     if (typeof tag === "function") {
-        // props may be omitted and passed as children in our factories
+        // FIX: intercetta la chiamata diretta senza argomenti (es. PageA())
+        if (props === undefined && children.length === 0) {
+            return createComponentVNode(tag, {}, []);
+        }
+
         const realProps = (props && typeof props === 'object' && !Array.isArray(props)) ? props : {};
         const realChildren = (props && typeof props === 'object' && !Array.isArray(props)) ? children : [props, ...children];
         const flatChildren = realChildren.flat().filter(c => c !== undefined && c !== null);
         return createComponentVNode(tag, realProps, flatChildren);
     }
 
-    // tag element
+    // tag HTML normale
     if (
         props == null ||
         typeof props !== "object" ||
@@ -60,46 +65,66 @@ function h(tag, props, ...children) {
     }
 
     const flatChildren = children.flatMap(c => Array.isArray(c) ? c : [c]).filter(c => c !== undefined && c !== null);
-
     return createVNode(tag, props, flatChildren);
 }
 
-// createDom: crea nodi DOM da VNode (componenti incluse)
+// ------------------ Lifecycle: Unmount ------------------
+
+function unmount(vnode) {
+    if (!vnode) return;
+
+    if (typeof vnode === "string" || typeof vnode === "number") return;
+
+    if (vnode.isComponent) {
+        if (vnode.rendered) unmount(vnode.rendered);
+        if (vnode.instance) {
+            vnode.instance.state = [];
+            vnode.instance.cursor = 0;
+        }
+        vnode.instance = null;
+        vnode.rendered = null;
+        vnode.el = null;
+    } else {
+        if (vnode.children && vnode.children.length) {
+            vnode.children.forEach(child => unmount(child));
+        }
+        vnode.el = null;
+    }
+}
+
+// ------------------ Create DOM ------------------
+
 function createDom(vnode) {
     if (typeof vnode === "string" || typeof vnode === "number") {
         return document.createTextNode(String(vnode));
     }
 
     if (vnode.isComponent) {
-        // assegna/crea l'istanza del componente
         const instance = vnode.instance || { state: [], cursor: 0 };
         vnode.instance = instance;
 
+        const prevInstance = currentInstance;
         currentInstance = instance;
         instance.cursor = 0;
         const rendered = vnode.tag({ ...vnode.props, children: vnode.children });
-        currentInstance = null;
+        currentInstance = prevInstance;
 
         vnode.rendered = rendered;
         const dom = createDom(rendered);
-        vnode.el = dom; // riferimento al DOM radice del componente
+        vnode.el = dom;
         return dom;
     }
 
-    // elemento DOM normale
     const el = document.createElement(vnode.tag);
 
-    // props (eventi -> assegniamo come proprietà, non addEventListener)
     for (let [key, value] of Object.entries(vnode.props || {})) {
         if (key.startsWith("on") && typeof value === "function") {
-            // onclick, oninput, ecc. -> proprietà DOM
             el[key.toLowerCase()] = value;
         } else {
             el.setAttribute(key, value);
         }
     }
 
-    // children
     for (let child of vnode.children || []) {
         el.appendChild(createDom(child));
     }
@@ -108,21 +133,21 @@ function createDom(vnode) {
     return el;
 }
 
-// updateDom: diffing semplice e robusto
+// ------------------ Update DOM ------------------
+
 function updateDom(parent, oldVNode, newVNode, index = 0) {
-    // aggiungi
     if (!oldVNode) {
         parent.appendChild(createDom(newVNode));
         return;
     }
 
-    // rimuovi
     if (!newVNode) {
-        parent.removeChild(parent.childNodes[index]);
+        unmount(oldVNode);
+        const node = parent.childNodes[index];
+        if (node) parent.removeChild(node);
         return;
     }
 
-    // gestione dei nodi primitivi (string/number)
     const oldIsPrimitive = typeof oldVNode === "string" || typeof oldVNode === "number";
     const newIsPrimitive = typeof newVNode === "string" || typeof newVNode === "number";
 
@@ -133,23 +158,21 @@ function updateDom(parent, oldVNode, newVNode, index = 0) {
         return;
     }
 
-    // tag diverso -> replace
-    if (oldVNode.tag !== newVNode.tag) {
+    if (oldVNode.tag !== newVNode.tag || !!oldVNode.isComponent !== !!newVNode.isComponent) {
+        unmount(oldVNode);
         parent.replaceChild(createDom(newVNode), parent.childNodes[index]);
         return;
     }
 
-    // componente
     if (newVNode.isComponent) {
-        // riusa l'istanza del vecchio VNode
-        newVNode.instance = oldVNode.instance;
+        newVNode.instance = oldVNode.instance || { state: [], cursor: 0 };
+
+        const prevInstance = currentInstance;
         currentInstance = newVNode.instance;
         newVNode.instance.cursor = 0;
-
         const rendered = newVNode.tag({ ...newVNode.props, children: newVNode.children });
-        currentInstance = null;
+        currentInstance = prevInstance;
 
-        // diff ricorsivo tra l'albero renderizzato precedente e il nuovo
         updateDom(parent, oldVNode.rendered, rendered, index);
 
         newVNode.rendered = rendered;
@@ -157,10 +180,8 @@ function updateDom(parent, oldVNode, newVNode, index = 0) {
         return;
     }
 
-    // elemento DOM regolare: aggiorna attributi e figli
     const el = parent.childNodes[index];
 
-    // aggiorna / aggiungi props
     for (let [key, value] of Object.entries(newVNode.props || {})) {
         if (key.startsWith("on") && typeof value === "function") {
             el[key.toLowerCase()] = value;
@@ -169,7 +190,6 @@ function updateDom(parent, oldVNode, newVNode, index = 0) {
         }
     }
 
-    // rimuovi props non più presenti
     for (let key in (oldVNode.props || {})) {
         if (!(key in (newVNode.props || {}))) {
             if (key.startsWith("on")) {
@@ -180,7 +200,6 @@ function updateDom(parent, oldVNode, newVNode, index = 0) {
         }
     }
 
-    // figli: ricorsione
     const maxLen = Math.max(oldVNode.children.length, newVNode.children.length);
     for (let i = 0; i < maxLen; i++) {
         updateDom(el, oldVNode.children[i], newVNode.children[i], i);
@@ -194,9 +213,8 @@ function updateDom(parent, oldVNode, newVNode, index = 0) {
 let oldTree = null;
 
 function renderComponent(root, component) {
-    // root è il DOM element (container), component è la funzione App
     rerender = () => renderComponent(root, component);
-    const newTree = h(component, {}); // VNode radice tipo componente
+    const newTree = h(component, {});
     if (!oldTree) {
         root.innerHTML = "";
         root.appendChild(createDom(newTree));
