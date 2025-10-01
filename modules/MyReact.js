@@ -26,6 +26,7 @@ function useState(initial) {
     }
 
     instance.cursor++;
+    console.log(instance.state[idx])
     return [instance.state[idx], setState];
 }
 
@@ -136,12 +137,12 @@ function createDom(vnode) {
 // ------------------ Update DOM ------------------
 
 function updateDom(parent, oldVNode, newVNode, index = 0) {
-    if (!oldVNode) {
+    if (oldVNode == undefined || oldVNode == null) {
         parent.appendChild(createDom(newVNode));
         return;
     }
 
-    if (!newVNode) {
+    if (newVNode == undefined || newVNode == null) {
         unmount(oldVNode);
         const node = parent.childNodes[index];
         if (node) parent.removeChild(node);
