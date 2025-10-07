@@ -3,30 +3,41 @@ let component;
 
 // Mappa che associa ogni componente ai suoi stati
 let componentStates = new Map();
-let componentEffects = new Map(); // Mappa per gli effetti
-let currentComponent = null;
-let stateIndex = 0;
-let componentStack = []; // Stack per tracciare la gerarchia di chiamate
+let componentEffects = new Map();
+let componentStack = [];
+let componentIds = new WeakMap();
+let nextComponentId = 0;
+let activeComponentIds = new Set();
+
+// Virtual DOM
+let oldVTree = null;
+let domNodeMap = new WeakMap(); // Mappa VNode → DOM reale
+
+function getComponentId(fn) {
+    if (!componentIds.has(fn)) {
+        componentIds.set(fn, `comp_${nextComponentId++}`);
+    }
+    return componentIds.get(fn);
+}
 
 function useState(initial) {
-    // Usa l'ultimo componente nello stack (quello attualmente in esecuzione)
     const activeComponent = componentStack[componentStack.length - 1];
+    const componentId = getComponentId(activeComponent);
     
-    // Ottieni o crea l'array di stati per il componente corrente
-    if (!componentStates.has(activeComponent)) {
-        componentStates.set(activeComponent, []);
+    activeComponentIds.add(componentId);
+    
+    if (!componentStates.has(componentId)) {
+        componentStates.set(componentId, []);
     }
     
-    const states = componentStates.get(activeComponent);
+    const states = componentStates.get(componentId);
     
-    // Usa un indice locale per questo specifico componente
     if (!activeComponent._stateIndex) {
         activeComponent._stateIndex = 0;
     }
     
     const currentIndex = activeComponent._stateIndex;
 
-    // Se non c'è già un valore, inizializza
     if (states[currentIndex] === undefined) {
         states[currentIndex] = initial;
     }
@@ -36,54 +47,46 @@ function useState(initial) {
         update();
     }
     
-    activeComponent._stateIndex++; // passa al prossimo hook per questo componente
+    activeComponent._stateIndex++;
     return [states[currentIndex], setState];
 }
 
 function useEffect(callback, dependencies) {
     const activeComponent = componentStack[componentStack.length - 1];
+    const componentId = getComponentId(activeComponent);
     
-    // Ottieni o crea l'array di effetti per il componente corrente
-    if (!componentEffects.has(activeComponent)) {
-        componentEffects.set(activeComponent, []);
+    activeComponentIds.add(componentId);
+    
+    if (!componentEffects.has(componentId)) {
+        componentEffects.set(componentId, []);
     }
     
-    const effects = componentEffects.get(activeComponent);
+    const effects = componentEffects.get(componentId);
     
-    // Usa un indice locale per questo specifico componente
     if (!activeComponent._effectIndex) {
         activeComponent._effectIndex = 0;
     }
     
     const currentIndex = activeComponent._effectIndex;
-    
-    // Recupera l'effetto precedente (se esiste)
     const prevEffect = effects[currentIndex];
     
-    // Determina se l'effetto deve essere eseguito
     let shouldRun = false;
     
     if (!prevEffect) {
-        // Prima esecuzione: esegui sempre
         shouldRun = true;
     } else if (!dependencies) {
-        // Nessun array di dipendenze: esegui ad ogni render
         shouldRun = true;
     } else if (dependencies.length === 0) {
-        // Array vuoto: esegui solo al mount (prima volta)
         shouldRun = false;
     } else {
-        // Confronta le dipendenze
         shouldRun = dependencies.some((dep, i) => dep !== prevEffect.dependencies[i]);
     }
     
-    // Salva l'effetto corrente
     effects[currentIndex] = {
         callback,
         dependencies: dependencies ? [...dependencies] : null
     };
     
-    // Esegui l'effetto dopo il render (usando setTimeout per simulare il comportamento asincrono)
     if (shouldRun) {
         setTimeout(() => {
             callback();
@@ -93,61 +96,198 @@ function useEffect(callback, dependencies) {
     activeComponent._effectIndex++;
 }
 
-// Funzione helper per wrappare i componenti
+// Virtual Node
+function createVNode(type, props, children) {
+    return {
+        type,
+        props: props || {},
+        children: children || [],
+        key: props?.key
+    };
+}
+
 function createComponent(fn) {
     return function(...args) {
-        // Aggiungi questo componente allo stack
+        const componentId = getComponentId(fn);
+        activeComponentIds.add(componentId);
         componentStack.push(fn);
         
-        // Reset dell'indice degli hook per questo componente
         fn._stateIndex = 0;
         fn._effectIndex = 0;
         
-        // Esegui il componente
         const result = fn(...args);
-        
-        // Rimuovi il componente dallo stack
         componentStack.pop();
         
         return result;
     };
 }
 
+// Converte elementi in VNodes
 function h(tag, props, ...children) {
-    const result = document.createElement(tag);
-    if (props) {
-        for (const [key, value] of Object.entries(props)) {
-            if (key.startsWith("on") && typeof value === "function") {
-                result[key.toLowerCase()] = value;
-            } else {
-                result.setAttribute(key, value);
+    const flatChildren = children.flat(Infinity).filter(child => child != null && child !== false);
+    
+    const normalizedChildren = flatChildren.map(child => {
+        if (typeof child === "string" || typeof child === "number") {
+            return createVNode("TEXT", { textContent: String(child) }, []);
+        } else if (typeof child === "function") {
+            return createComponent(child)();
+        } else if (child.type) {
+            // È già un VNode
+            return child;
+        } else if (child instanceof Node) {
+            // Nodo DOM esistente - wrappalo
+            return createVNode("DOM_NODE", { node: child }, []);
+        }
+        return createVNode("TEXT", { textContent: String(child) }, []);
+    });
+    
+    return createVNode(tag, props, normalizedChildren);
+}
+
+// Crea un elemento DOM reale da un VNode
+function createDOMElement(vnode) {
+    if (vnode.type === "TEXT") {
+        const textNode = document.createTextNode(vnode.props.textContent || "");
+        domNodeMap.set(vnode, textNode);
+        return textNode;
+    }
+    
+    if (vnode.type === "DOM_NODE") {
+        return vnode.props.node;
+    }
+    
+    const element = document.createElement(vnode.type);
+    domNodeMap.set(vnode, element);
+    
+    // Applica props
+    updateProps(element, {}, vnode.props);
+    
+    // Aggiungi children
+    for (const child of vnode.children) {
+        element.appendChild(createDOMElement(child));
+    }
+    
+    return element;
+}
+
+// Aggiorna le props di un elemento
+function updateProps(domElement, oldProps, newProps) {
+    // Rimuovi vecchie props
+    for (const key in oldProps) {
+        if (!(key in newProps)) {
+            if (key.startsWith("on")) {
+                domElement[key.toLowerCase()] = null;
+            } else if (key !== "key") {
+                domElement.removeAttribute(key);
             }
         }
     }
     
-    for (const child of children) {
-        if (typeof child === "string") {
-            result.appendChild(document.createTextNode(child));
-        } else if (typeof child === "function") {
-            // Se il child è un componente, wrappalo e chiamalo
-            result.appendChild(createComponent(child)());
-        } else {
-            result.appendChild(child);
+    // Aggiungi/aggiorna nuove props
+    for (const key in newProps) {
+        if (key === "key") continue;
+        
+        if (oldProps[key] !== newProps[key]) {
+            if (key.startsWith("on") && typeof newProps[key] === "function") {
+                domElement[key.toLowerCase()] = newProps[key];
+            } else {
+                domElement.setAttribute(key, newProps[key]);
+            }
         }
     }
+}
 
-    return result;
+// Diffing algorithm
+function diff(parentDom, oldVNode, newVNode, index = 0) {
+    // Caso 1: Nuovo nodo aggiunto
+    if (!oldVNode && newVNode) {
+        const newDom = createDOMElement(newVNode);
+        parentDom.appendChild(newDom);
+        return;
+    }
+    
+    // Caso 2: Nodo rimosso
+    if (oldVNode && !newVNode) {
+        const domNode = domNodeMap.get(oldVNode);
+        if (domNode && domNode.parentNode) {
+            domNode.parentNode.removeChild(domNode);
+        }
+        return;
+    }
+    
+    // Caso 3: Tipo di nodo cambiato
+    if (oldVNode.type !== newVNode.type) {
+        const oldDom = domNodeMap.get(oldVNode);
+        const newDom = createDOMElement(newVNode);
+        
+        if (oldDom && oldDom.parentNode) {
+            oldDom.parentNode.replaceChild(newDom, oldDom);
+        }
+        return;
+    }
+    
+    // Caso 4: Stesso tipo - aggiorna
+    const domNode = domNodeMap.get(oldVNode);
+    domNodeMap.set(newVNode, domNode);
+    
+    // Aggiorna text content
+    if (newVNode.type === "TEXT") {
+        if (oldVNode.props.textContent !== newVNode.props.textContent) {
+            domNode.textContent = newVNode.props.textContent;
+        }
+        return;
+    }
+    
+    // Aggiorna props
+    if (newVNode.type !== "DOM_NODE") {
+        updateProps(domNode, oldVNode.props, newVNode.props);
+    }
+    
+    // Diffing dei children
+    const oldChildren = oldVNode.children || [];
+    const newChildren = newVNode.children || [];
+    const maxLength = Math.max(oldChildren.length, newChildren.length);
+    
+    for (let i = 0; i < maxLength; i++) {
+        diff(domNode, oldChildren[i], newChildren[i], i);
+    }
 }
 
 function update() {
-    root.innerHTML = "";
-    componentStack = []; // Reset dello stack
-    render(component);
+    const previousActiveIds = new Set(activeComponentIds);
+    activeComponentIds.clear();
+    componentStack = [];
+    
+    // Crea nuovo virtual tree
+    const newVTree = createComponent(component)();
+    
+    // Applica il diff
+    if (oldVTree) {
+        diff(root, oldVTree, newVTree);
+    } else {
+        // Primo render
+        root.innerHTML = "";
+        root.appendChild(createDOMElement(newVTree));
+    }
+    
+    oldVTree = newVTree;
+    
+    // Cleanup componenti inattivi
+    for (const id of previousActiveIds) {
+        if (!activeComponentIds.has(id)) {
+            componentStates.delete(id);
+            componentEffects.delete(id);
+        }
+    }
 }
 
 function render(comp) {
     component = comp;
-    root.appendChild(createComponent(comp)());
+    activeComponentIds.clear();
+    
+    const newVTree = createComponent(comp)();
+    root.appendChild(createDOMElement(newVTree));
+    oldVTree = newVTree;
 }
 
 // TAG FACTORY
@@ -164,7 +304,8 @@ tags.forEach(tag => {
             args[0] != null &&
             typeof args[0] === "object" &&
             !Array.isArray(args[0]) &&
-            !(args[0] instanceof Node)
+            !(args[0] instanceof Node) &&
+            !args[0].type // Non è un VNode
         ) {
             props = args[0];
             children = args.slice(1);
