@@ -3,6 +3,7 @@ let component;
 
 // Mappa che associa ogni componente ai suoi stati
 let componentStates = new Map();
+let componentEffects = new Map(); // Mappa per gli effetti
 let currentComponent = null;
 let stateIndex = 0;
 let componentStack = []; // Stack per tracciare la gerarchia di chiamate
@@ -39,6 +40,59 @@ function useState(initial) {
     return [states[currentIndex], setState];
 }
 
+function useEffect(callback, dependencies) {
+    const activeComponent = componentStack[componentStack.length - 1];
+    
+    // Ottieni o crea l'array di effetti per il componente corrente
+    if (!componentEffects.has(activeComponent)) {
+        componentEffects.set(activeComponent, []);
+    }
+    
+    const effects = componentEffects.get(activeComponent);
+    
+    // Usa un indice locale per questo specifico componente
+    if (!activeComponent._effectIndex) {
+        activeComponent._effectIndex = 0;
+    }
+    
+    const currentIndex = activeComponent._effectIndex;
+    
+    // Recupera l'effetto precedente (se esiste)
+    const prevEffect = effects[currentIndex];
+    
+    // Determina se l'effetto deve essere eseguito
+    let shouldRun = false;
+    
+    if (!prevEffect) {
+        // Prima esecuzione: esegui sempre
+        shouldRun = true;
+    } else if (!dependencies) {
+        // Nessun array di dipendenze: esegui ad ogni render
+        shouldRun = true;
+    } else if (dependencies.length === 0) {
+        // Array vuoto: esegui solo al mount (prima volta)
+        shouldRun = false;
+    } else {
+        // Confronta le dipendenze
+        shouldRun = dependencies.some((dep, i) => dep !== prevEffect.dependencies[i]);
+    }
+    
+    // Salva l'effetto corrente
+    effects[currentIndex] = {
+        callback,
+        dependencies: dependencies ? [...dependencies] : null
+    };
+    
+    // Esegui l'effetto dopo il render (usando setTimeout per simulare il comportamento asincrono)
+    if (shouldRun) {
+        setTimeout(() => {
+            callback();
+        }, 0);
+    }
+    
+    activeComponent._effectIndex++;
+}
+
 // Funzione helper per wrappare i componenti
 function createComponent(fn) {
     return function(...args) {
@@ -47,6 +101,7 @@ function createComponent(fn) {
         
         // Reset dell'indice degli hook per questo componente
         fn._stateIndex = 0;
+        fn._effectIndex = 0;
         
         // Esegui il componente
         const result = fn(...args);
