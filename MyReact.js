@@ -5,6 +5,8 @@ let component = null;
 // Component state management
 const componentStates = new Map();
 const componentEffects = new Map();
+const componentMemos = new Map();
+const componentCallbacks = new Map();
 const componentIds = new WeakMap();
 let nextComponentId = 0;
 
@@ -12,9 +14,27 @@ let nextComponentId = 0;
 let componentStack = [];
 let activeComponentIds = new Set();
 
+// Context management
+const contextStack = [];
+let nextContextId = 0;
+
 // Virtual DOM management
 let oldVTree = null;
 const domNodeMap = new WeakMap();
+
+// Batching system
+let updateScheduled = false;
+let batchedUpdates = new Set();
+const BATCH_DELAY = 0;
+
+// Render loop protection
+const MAX_UPDATES_PER_SECOND = 100;
+let updateCount = 0;
+let lastResetTime = Date.now();
+
+// Debouncing for large trees
+let debounceTimer = null;
+const DEBOUNCE_DELAY = 16; // ~60fps
 
 // ============================================================================
 // Component ID Management
@@ -28,6 +48,99 @@ function getComponentId(fn) {
 }
 
 // ============================================================================
+// Context API Implementation
+// ============================================================================
+
+function createContext(defaultValue) {
+    const contextId = `context_${nextContextId++}`;
+    
+    const context = {
+        _id: contextId,
+        _defaultValue: defaultValue,
+        Provider: function({ value, children }) {
+            contextStack.push({ id: contextId, value });
+            
+            if (Array.isArray(children)) {
+                return h('div', {}, ...children);
+            }
+            
+            return children;
+        },
+        Consumer: function({ children }) {
+            const value = useContext(context);
+            return typeof children === 'function' ? children(value) : children;
+        }
+    };
+    
+    return context;
+}
+
+function useContext(context) {
+    if (!context || !context._id) {
+        throw new Error('useContext must be called with a valid context object');
+    }
+    
+    for (let i = contextStack.length - 1; i >= 0; i--) {
+        if (contextStack[i].id === context._id) {
+            return contextStack[i].value;
+        }
+    }
+    
+    return context._defaultValue;
+}
+
+// ============================================================================
+// Batching and Update Protection
+// ============================================================================
+
+function checkRenderLoop() {
+    const now = Date.now();
+    
+    // Reset counter every second
+    if (now - lastResetTime > 1000) {
+        updateCount = 0;
+        lastResetTime = now;
+    }
+    
+    updateCount++;
+    
+    if (updateCount > MAX_UPDATES_PER_SECOND) {
+        console.error('Render loop detected! Too many updates per second.');
+        throw new Error('Infinite render loop detected. Check your useEffect dependencies.');
+    }
+}
+
+function scheduleUpdate(updateFn) {
+    batchedUpdates.add(updateFn);
+    
+    if (!updateScheduled) {
+        updateScheduled = true;
+        
+        // Debounce for large trees
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            Promise.resolve().then(flushUpdates);
+        }, BATCH_DELAY);
+    }
+}
+
+function flushUpdates() {
+    if (batchedUpdates.size === 0) {
+        updateScheduled = false;
+        return;
+    }
+    
+    checkRenderLoop();
+    
+    const updates = Array.from(batchedUpdates);
+    batchedUpdates.clear();
+    updateScheduled = false;
+    
+    // Execute all batched updates
+    updates.forEach(fn => fn());
+}
+
+// ============================================================================
 // React Hooks Implementation
 // ============================================================================
 
@@ -37,32 +150,74 @@ function useState(initial) {
     
     activeComponentIds.add(componentId);
     
-    // Initialize state array for component if needed
     if (!componentStates.has(componentId)) {
         componentStates.set(componentId, []);
     }
     
     const states = componentStates.get(componentId);
     
-    // Initialize state index for this render
     if (!activeComponent._stateIndex) {
         activeComponent._stateIndex = 0;
     }
     
     const currentIndex = activeComponent._stateIndex;
 
-    // Set initial value if this is the first render
     if (states[currentIndex] === undefined) {
         states[currentIndex] = initial;
     }
     
     function setState(newValue) {
-        states[currentIndex] = newValue;
-        update();
+        const value = typeof newValue === 'function' 
+            ? newValue(states[currentIndex]) 
+            : newValue;
+        
+        if (Object.is(states[currentIndex], value)) {
+            return; // Skip update if value hasn't changed
+        }
+        
+        states[currentIndex] = value;
+        scheduleUpdate(() => update());
     }
     
     activeComponent._stateIndex++;
     return [states[currentIndex], setState];
+}
+
+function useReducer(reducer, initialState, init) {
+    const activeComponent = componentStack[componentStack.length - 1];
+    const componentId = getComponentId(activeComponent);
+    
+    activeComponentIds.add(componentId);
+    
+    if (!componentStates.has(componentId)) {
+        componentStates.set(componentId, []);
+    }
+    
+    const states = componentStates.get(componentId);
+    
+    if (!activeComponent._stateIndex) {
+        activeComponent._stateIndex = 0;
+    }
+    
+    const currentIndex = activeComponent._stateIndex;
+
+    if (states[currentIndex] === undefined) {
+        states[currentIndex] = init ? init(initialState) : initialState;
+    }
+    
+    function dispatch(action) {
+        const newState = reducer(states[currentIndex], action);
+        
+        if (Object.is(states[currentIndex], newState)) {
+            return;
+        }
+        
+        states[currentIndex] = newState;
+        scheduleUpdate(() => update());
+    }
+    
+    activeComponent._stateIndex++;
+    return [states[currentIndex], dispatch];
 }
 
 function useEffect(callback, dependencies) {
@@ -71,14 +226,12 @@ function useEffect(callback, dependencies) {
     
     activeComponentIds.add(componentId);
     
-    // Initialize effects array for component if needed
     if (!componentEffects.has(componentId)) {
         componentEffects.set(componentId, []);
     }
     
     const effects = componentEffects.get(componentId);
     
-    // Initialize effect index for this render
     if (!activeComponent._effectIndex) {
         activeComponent._effectIndex = 0;
     }
@@ -86,41 +239,188 @@ function useEffect(callback, dependencies) {
     const currentIndex = activeComponent._effectIndex;
     const prevEffect = effects[currentIndex];
     
-    // Determine if effect should run
     const shouldRun = shouldRunEffect(prevEffect, dependencies);
     
-    // Store effect with its dependencies
     effects[currentIndex] = {
         callback,
-        dependencies: dependencies ? [...dependencies] : null
+        dependencies: dependencies ? [...dependencies] : null,
+        cleanup: prevEffect?.cleanup,
+        isLayout: false
     };
     
-    // Schedule effect execution
     if (shouldRun) {
-        setTimeout(callback, 0);
+        setTimeout(() => {
+            // Run cleanup from previous effect
+            if (prevEffect?.cleanup) {
+                try {
+                    prevEffect.cleanup();
+                } catch (e) {
+                    console.error('Error in effect cleanup:', e);
+                }
+            }
+            
+            // Run new effect and store cleanup
+            try {
+                const cleanup = callback();
+                if (typeof cleanup === 'function') {
+                    effects[currentIndex].cleanup = cleanup;
+                }
+            } catch (e) {
+                console.error('Error in effect:', e);
+            }
+        }, 0);
     }
     
     activeComponent._effectIndex++;
 }
 
+function useLayoutEffect(callback, dependencies) {
+    const activeComponent = componentStack[componentStack.length - 1];
+    const componentId = getComponentId(activeComponent);
+    
+    activeComponentIds.add(componentId);
+    
+    if (!componentEffects.has(componentId)) {
+        componentEffects.set(componentId, []);
+    }
+    
+    const effects = componentEffects.get(componentId);
+    
+    if (!activeComponent._effectIndex) {
+        activeComponent._effectIndex = 0;
+    }
+    
+    const currentIndex = activeComponent._effectIndex;
+    const prevEffect = effects[currentIndex];
+    
+    const shouldRun = shouldRunEffect(prevEffect, dependencies);
+    
+    effects[currentIndex] = {
+        callback,
+        dependencies: dependencies ? [...dependencies] : null,
+        cleanup: prevEffect?.cleanup,
+        isLayout: true
+    };
+    
+    if (shouldRun) {
+        // Synchronous execution
+        if (prevEffect?.cleanup) {
+            try {
+                prevEffect.cleanup();
+            } catch (e) {
+                console.error('Error in layout effect cleanup:', e);
+            }
+        }
+        
+        try {
+            const cleanup = callback();
+            if (typeof cleanup === 'function') {
+                effects[currentIndex].cleanup = cleanup;
+            }
+        } catch (e) {
+            console.error('Error in layout effect:', e);
+        }
+    }
+    
+    activeComponent._effectIndex++;
+}
+
+function useMemo(factory, dependencies) {
+    const activeComponent = componentStack[componentStack.length - 1];
+    const componentId = getComponentId(activeComponent);
+    
+    activeComponentIds.add(componentId);
+    
+    if (!componentMemos.has(componentId)) {
+        componentMemos.set(componentId, []);
+    }
+    
+    const memos = componentMemos.get(componentId);
+    
+    if (!activeComponent._memoIndex) {
+        activeComponent._memoIndex = 0;
+    }
+    
+    const currentIndex = activeComponent._memoIndex;
+    const prevMemo = memos[currentIndex];
+    
+    // Check if we need to recompute
+    const shouldRecompute = !prevMemo || 
+        !dependencies || 
+        dependencies.some((dep, i) => !Object.is(dep, prevMemo.dependencies[i]));
+    
+    if (shouldRecompute) {
+        const value = factory();
+        memos[currentIndex] = {
+            value,
+            dependencies: dependencies ? [...dependencies] : null
+        };
+    }
+    
+    activeComponent._memoIndex++;
+    return memos[currentIndex].value;
+}
+
+function useCallback(callback, dependencies) {
+    return useMemo(() => callback, dependencies);
+}
+
 function shouldRunEffect(prevEffect, dependencies) {
-    // First render - always run
     if (!prevEffect) {
         return true;
     }
     
-    // No dependencies - always run
     if (!dependencies) {
         return true;
     }
     
-    // Empty dependencies array - run only once
     if (dependencies.length === 0) {
         return false;
     }
     
-    // Check if any dependency changed
-    return dependencies.some((dep, i) => dep !== prevEffect.dependencies[i]);
+    return dependencies.some((dep, i) => !Object.is(dep, prevEffect.dependencies[i]));
+}
+
+function useRef(initialValue) {
+    const activeComponent = componentStack[componentStack.length - 1];
+    const componentId = getComponentId(activeComponent);
+    
+    activeComponentIds.add(componentId);
+    
+    if (!componentStates.has(componentId)) {
+        componentStates.set(componentId, []);
+    }
+    
+    const states = componentStates.get(componentId);
+    
+    if (!activeComponent._stateIndex) {
+        activeComponent._stateIndex = 0;
+    }
+    
+    const currentIndex = activeComponent._stateIndex;
+
+    if (states[currentIndex] === undefined) {
+        states[currentIndex] = { current: initialValue };
+    }
+    
+    activeComponent._stateIndex++;
+    return states[currentIndex];
+}
+
+// ============================================================================
+// Lifecycle Helpers
+// ============================================================================
+
+function onMount(callback) {
+    useEffect(() => {
+        callback();
+    }, []);
+}
+
+function onUnmount(callback) {
+    useEffect(() => {
+        return callback;
+    }, []);
 }
 
 // ============================================================================
@@ -142,11 +442,16 @@ function createComponent(fn) {
         activeComponentIds.add(componentId);
         componentStack.push(fn);
         
-        // Reset hook indices for this render
         fn._stateIndex = 0;
         fn._effectIndex = 0;
+        fn._memoIndex = 0;
+        
+        const contextStackLength = contextStack.length;
         
         const result = fn(...args);
+        
+        contextStack.length = contextStackLength;
+        
         componentStack.pop();
         
         return result;
@@ -154,39 +459,32 @@ function createComponent(fn) {
 }
 
 function h(tag, props, ...children) {
-    // Flatten and filter children
     const flatChildren = children
         .flat(Infinity)
         .filter(child => child != null && child !== false);
     
-    // Normalize children to VNodes
     const normalizedChildren = flatChildren.map(child => normalizeChild(child));
     
     return createVNode(tag, props, normalizedChildren);
 }
 
 function normalizeChild(child) {
-    // String or number - convert to text node
     if (typeof child === "string" || typeof child === "number") {
         return createVNode("TEXT", { textContent: String(child) }, []);
     }
     
-    // Function component - execute it
     if (typeof child === "function") {
         return createComponent(child)();
     }
     
-    // Already a VNode
     if (child.type) {
         return child;
     }
     
-    // DOM Node - wrap it
     if (child instanceof Node) {
         return createVNode("DOM_NODE", { node: child }, []);
     }
     
-    // Fallback - convert to text
     return createVNode("TEXT", { textContent: String(child) }, []);
 }
 
@@ -195,26 +493,21 @@ function normalizeChild(child) {
 // ============================================================================
 
 function createDOMElement(vnode) {
-    // Text node
     if (vnode.type === "TEXT") {
         const textNode = document.createTextNode(vnode.props.textContent || "");
         domNodeMap.set(vnode, textNode);
         return textNode;
     }
     
-    // Existing DOM node
     if (vnode.type === "DOM_NODE") {
         return vnode.props.node;
     }
     
-    // Regular element
     const element = document.createElement(vnode.type);
     domNodeMap.set(vnode, element);
     
-    // Apply props
     updateProps(element, {}, vnode.props);
     
-    // Append children
     for (const child of vnode.children) {
         element.appendChild(createDOMElement(child));
     }
@@ -223,7 +516,6 @@ function createDOMElement(vnode) {
 }
 
 function updateProps(domElement, oldProps, newProps) {
-    // Remove old props
     for (const key in oldProps) {
         if (key in newProps || key === "key") continue;
         
@@ -236,7 +528,6 @@ function updateProps(domElement, oldProps, newProps) {
         }
     }
     
-    // Add/update new props
     for (const key in newProps) {
         if (key === "key" || oldProps[key] === newProps[key]) continue;
         
@@ -251,18 +542,16 @@ function updateProps(domElement, oldProps, newProps) {
 }
 
 // ============================================================================
-// Reconciliation (Diffing Algorithm)
+// Keyed Reconciliation (Diffing Algorithm)
 // ============================================================================
 
 function diff(parentDom, oldVNode, newVNode, index = 0) {
-    // New node added
     if (!oldVNode && newVNode) {
         const newDom = createDOMElement(newVNode);
         parentDom.appendChild(newDom);
         return;
     }
     
-    // Node removed
     if (oldVNode && !newVNode) {
         const domNode = domNodeMap.get(oldVNode);
         if (domNode?.parentNode) {
@@ -271,7 +560,6 @@ function diff(parentDom, oldVNode, newVNode, index = 0) {
         return;
     }
     
-    // Node type changed - replace
     if (oldVNode.type !== newVNode.type) {
         const oldDom = domNodeMap.get(oldVNode);
         const newDom = createDOMElement(newVNode);
@@ -282,11 +570,9 @@ function diff(parentDom, oldVNode, newVNode, index = 0) {
         return;
     }
     
-    // Same type - update existing node
     const domNode = domNodeMap.get(oldVNode);
     domNodeMap.set(newVNode, domNode);
     
-    // Update text content
     if (newVNode.type === "TEXT") {
         if (oldVNode.props.textContent !== newVNode.props.textContent) {
             domNode.textContent = newVNode.props.textContent;
@@ -294,19 +580,109 @@ function diff(parentDom, oldVNode, newVNode, index = 0) {
         return;
     }
     
-    // Update props for regular elements
     if (newVNode.type !== "DOM_NODE") {
         updateProps(domNode, oldVNode.props, newVNode.props);
     }
     
-    // Recursively diff children
-    const oldChildren = oldVNode.children || [];
-    const newChildren = newVNode.children || [];
-    const maxLength = Math.max(oldChildren.length, newChildren.length);
+    // Keyed diffing for children
+    diffChildren(domNode, oldVNode.children || [], newVNode.children || []);
+}
+
+function diffChildren(parentDom, oldChildren, newChildren) {
+    // Build maps for keyed children
+    const oldKeyedChildren = new Map();
+    const oldIndexedChildren = [];
     
-    for (let i = 0; i < maxLength; i++) {
-        diff(domNode, oldChildren[i], newChildren[i], i);
+    oldChildren.forEach((child, index) => {
+        if (child.key != null) {
+            oldKeyedChildren.set(child.key, { child, index });
+        } else {
+            oldIndexedChildren.push({ child, index });
+        }
+    });
+    
+    let oldIndexPointer = 0;
+    
+    newChildren.forEach((newChild, newIndex) => {
+        let oldChild = null;
+        let oldIndex = -1;
+        
+        // Try to match by key first
+        if (newChild.key != null && oldKeyedChildren.has(newChild.key)) {
+            const match = oldKeyedChildren.get(newChild.key);
+            oldChild = match.child;
+            oldIndex = match.index;
+            oldKeyedChildren.delete(newChild.key);
+        }
+        // Fallback to positional matching for non-keyed children
+        else if (newChild.key == null && oldIndexPointer < oldIndexedChildren.length) {
+            const match = oldIndexedChildren[oldIndexPointer];
+            oldChild = match.child;
+            oldIndex = match.index;
+            oldIndexPointer++;
+        }
+        
+        if (oldChild) {
+            // Update existing child
+            diff(parentDom, oldChild, newChild, newIndex);
+            
+            // Move DOM node if position changed
+            const currentDom = domNodeMap.get(newChild);
+            const expectedDom = parentDom.childNodes[newIndex];
+            
+            if (currentDom !== expectedDom) {
+                parentDom.insertBefore(currentDom, expectedDom || null);
+            }
+        } else {
+            // Insert new child
+            const newDom = createDOMElement(newChild);
+            const refNode = parentDom.childNodes[newIndex] || null;
+            parentDom.insertBefore(newDom, refNode);
+        }
+    });
+    
+    // Remove unused keyed children
+    oldKeyedChildren.forEach(({ child }) => {
+        const domNode = domNodeMap.get(child);
+        if (domNode?.parentNode) {
+            domNode.parentNode.removeChild(domNode);
+        }
+    });
+    
+    // Remove extra indexed children
+    for (let i = oldIndexPointer; i < oldIndexedChildren.length; i++) {
+        const { child } = oldIndexedChildren[i];
+        const domNode = domNodeMap.get(child);
+        if (domNode?.parentNode) {
+            domNode.parentNode.removeChild(domNode);
+        }
     }
+}
+
+// ============================================================================
+// Component Cleanup
+// ============================================================================
+
+function cleanupComponent(componentId) {
+    // Run all effect cleanups
+    const effects = componentEffects.get(componentId);
+    if (effects) {
+        effects.forEach(effect => {
+            if (effect?.cleanup) {
+                try {
+                    effect.cleanup();
+                } catch (e) {
+                    console.error('Error in cleanup:', e);
+                }
+            }
+        });
+    }
+    
+    // Clear component data
+    componentStates.delete(componentId);
+    componentEffects.delete(componentId);
+    componentMemos.delete(componentId);
+    componentCallbacks.delete(componentId);
 }
 
 // ============================================================================
@@ -317,11 +693,10 @@ function update() {
     const previousActiveIds = new Set(activeComponentIds);
     activeComponentIds.clear();
     componentStack = [];
+    contextStack.length = 0;
     
-    // Create new virtual tree
     const newVTree = createComponent(component)();
     
-    // Diff and update DOM
     if (oldVTree) {
         diff(root, oldVTree, newVTree);
     } else {
@@ -334,8 +709,7 @@ function update() {
     // Cleanup unmounted components
     for (const id of previousActiveIds) {
         if (!activeComponentIds.has(id)) {
-            componentStates.delete(id);
-            componentEffects.delete(id);
+            cleanupComponent(id);
         }
     }
 }
@@ -343,6 +717,7 @@ function update() {
 function render(comp) {
     component = comp;
     activeComponentIds.clear();
+    contextStack.length = 0;
     
     const newVTree = createComponent(comp)();
     root.appendChild(createDOMElement(newVTree));
@@ -366,7 +741,7 @@ const HTML_TAGS = [
     "colgroup", "col", "thead", "tbody", "tfoot", "tr", "th", "td", "form",
     "fieldset", "legend", "label", "input", "button", "select", "datalist",
     "optgroup", "option", "textarea", "output", "details", "summary", "dialog",
-    "menu", "menuitem"
+    "menu", "menuitem", "svg", "path"
 ];
 
 const elements = {};
@@ -376,7 +751,6 @@ HTML_TAGS.forEach(tag => {
         let props = {};
         let children = args;
 
-        // First argument is props object if it's a plain object
         const isPropsObject = args.length > 0 &&
             args[0] != null &&
             typeof args[0] === "object" &&
@@ -393,7 +767,6 @@ HTML_TAGS.forEach(tag => {
     };
 });
 
-// Export all HTML element helpers
 const {
     html, head, title, base, link, meta, style, body, header, nav, main, section,
     article, aside, footer, h1, h2, h3, h4, h5, h6, hgroup, p, hr, pre, blockquote,
@@ -403,5 +776,5 @@ const {
     embed, object, param, iframe, source, script, noscript, canvas, template, slot,
     del, ins, table, caption, colgroup, col, thead, tbody, tfoot, tr, th, td,
     form, fieldset, legend, label, input, button, select, datalist, optgroup,
-    option, textarea, output, details, summary, dialog, menu, menuitem
+    option, textarea, output, details, summary, dialog, menu, menuitem, svg, path
 } = elements;
