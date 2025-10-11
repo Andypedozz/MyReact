@@ -1,40 +1,105 @@
-// Root DOM element and main component
+/**
+ * MyReact - A lightweight React-like framework
+ * Version 1.0.0
+ * No JSX, no build step required
+ */
+
+// ============================================================================
+// Global Configuration
+// ============================================================================
+
+let DEBUG_MODE = false;
+
+// ============================================================================
+// Root Management
+// ============================================================================
+
 let root = null;
 let component = null;
 
-// Component state management
+// ============================================================================
+// Component State Management
+// ============================================================================
+
 const componentStates = new Map();
 const componentEffects = new Map();
 const componentMemos = new Map();
 const componentCallbacks = new Map();
 const componentIds = new WeakMap();
+const componentInstances = new Map();
 let nextComponentId = 0;
 
-// Execution context tracking
+// ============================================================================
+// Execution Context Tracking
+// ============================================================================
+
 let componentStack = [];
 let activeComponentIds = new Set();
+let currentInstanceKey = null;
 
-// Context management
+// ============================================================================
+// Context Management
+// ============================================================================
+
 const contextStack = [];
 let nextContextId = 0;
 
-// Virtual DOM management
+// ============================================================================
+// Virtual DOM Management
+// ============================================================================
+
 let oldVTree = null;
 const domNodeMap = new WeakMap();
 
-// Batching system
+// ============================================================================
+// Batching System
+// ============================================================================
+
 let updateScheduled = false;
 let batchedUpdates = new Set();
 const BATCH_DELAY = 0;
 
-// Render loop protection
+// ============================================================================
+// Render Loop Protection
+// ============================================================================
+
 const MAX_UPDATES_PER_SECOND = 100;
 let updateCount = 0;
 let lastResetTime = Date.now();
 
-// Debouncing for large trees
+// ============================================================================
+// Debouncing for Large Trees
+// ============================================================================
+
 let debounceTimer = null;
 const DEBOUNCE_DELAY = 16; // ~60fps
+
+// ============================================================================
+// Event Delegation System
+// ============================================================================
+
+const delegatedEvents = new Set(['click', 'input', 'change', 'submit', 'keydown', 'keyup', 'focus', 'blur']);
+let eventDelegationInitialized = false;
+
+function initEventDelegation() {
+    if (eventDelegationInitialized) return;
+    
+    delegatedEvents.forEach(eventType => {
+        document.addEventListener(eventType, (e) => {
+            let target = e.target;
+            
+            while (target && target !== document) {
+                if (target.__listeners && target.__listeners[eventType]) {
+                    target.__listeners[eventType](e);
+                    break;
+                }
+                target = target.parentNode;
+            }
+        }, true);
+    });
+    
+    eventDelegationInitialized = true;
+}
 
 // ============================================================================
 // Component ID Management
@@ -47,10 +112,19 @@ function getComponentId(fn) {
     return componentIds.get(fn);
 }
 
+function getInstanceKey(componentId, key) {
+    return `${componentId}_${key || 'default'}`;
+}
+
 // ============================================================================
 // Context API Implementation
 // ============================================================================
 
+/**
+ * Creates a new React-like context
+ * @param {*} defaultValue - The default value for the context
+ * @returns {Object} Context object with Provider and Consumer
+ */
 function createContext(defaultValue) {
     const contextId = `context_${nextContextId++}`;
     
@@ -75,6 +149,11 @@ function createContext(defaultValue) {
     return context;
 }
 
+/**
+ * Hook to consume a context value
+ * @param {Object} context - Context object created by createContext
+ * @returns {*} The current context value
+ */
 function useContext(context) {
     if (!context || !context._id) {
         throw new Error('useContext must be called with a valid context object');
@@ -96,7 +175,6 @@ function useContext(context) {
 function checkRenderLoop() {
     const now = Date.now();
     
-    // Reset counter every second
     if (now - lastResetTime > 1000) {
         updateCount = 0;
         lastResetTime = now;
@@ -116,7 +194,6 @@ function scheduleUpdate(updateFn) {
     if (!updateScheduled) {
         updateScheduled = true;
         
-        // Debounce for large trees
         clearTimeout(debounceTimer);
         debounceTimer = setTimeout(() => {
             Promise.resolve().then(flushUpdates);
@@ -136,7 +213,6 @@ function flushUpdates() {
     batchedUpdates.clear();
     updateScheduled = false;
     
-    // Execute all batched updates
     updates.forEach(fn => fn());
 }
 
@@ -144,68 +220,88 @@ function flushUpdates() {
 // React Hooks Implementation
 // ============================================================================
 
+/**
+ * Hook for managing component state
+ * @param {*} initial - Initial state value
+ * @returns {Array} [state, setState] tuple
+ */
 function useState(initial) {
     const activeComponent = componentStack[componentStack.length - 1];
     const componentId = getComponentId(activeComponent);
+    const instanceKey = currentInstanceKey;
     
-    activeComponentIds.add(componentId);
+    activeComponentIds.add(instanceKey);
     
-    if (!componentStates.has(componentId)) {
-        componentStates.set(componentId, []);
+    if (!componentStates.has(instanceKey)) {
+        componentStates.set(instanceKey, []);
     }
     
-    const states = componentStates.get(componentId);
+    const states = componentStates.get(instanceKey);
+    const instance = componentInstances.get(instanceKey);
     
-    if (!activeComponent._stateIndex) {
-        activeComponent._stateIndex = 0;
+    if (!instance._stateIndex) {
+        instance._stateIndex = 0;
     }
     
-    const currentIndex = activeComponent._stateIndex;
+    const currentIndex = instance._stateIndex;
 
     if (states[currentIndex] === undefined) {
         states[currentIndex] = initial;
     }
     
     function setState(newValue) {
+        if (instance._unmounted) return;
+        
         const value = typeof newValue === 'function' 
             ? newValue(states[currentIndex]) 
             : newValue;
         
         if (Object.is(states[currentIndex], value)) {
-            return; // Skip update if value hasn't changed
+            return;
         }
         
         states[currentIndex] = value;
         scheduleUpdate(() => update());
     }
     
-    activeComponent._stateIndex++;
+    instance._stateIndex++;
     return [states[currentIndex], setState];
 }
 
+/**
+ * Hook for managing state with a reducer
+ * @param {Function} reducer - Reducer function
+ * @param {*} initialState - Initial state
+ * @param {Function} init - Optional initialization function
+ * @returns {Array} [state, dispatch] tuple
+ */
 function useReducer(reducer, initialState, init) {
     const activeComponent = componentStack[componentStack.length - 1];
     const componentId = getComponentId(activeComponent);
+    const instanceKey = currentInstanceKey;
     
-    activeComponentIds.add(componentId);
+    activeComponentIds.add(instanceKey);
     
-    if (!componentStates.has(componentId)) {
-        componentStates.set(componentId, []);
+    if (!componentStates.has(instanceKey)) {
+        componentStates.set(instanceKey, []);
     }
     
-    const states = componentStates.get(componentId);
+    const states = componentStates.get(instanceKey);
+    const instance = componentInstances.get(instanceKey);
     
-    if (!activeComponent._stateIndex) {
-        activeComponent._stateIndex = 0;
+    if (!instance._stateIndex) {
+        instance._stateIndex = 0;
     }
     
-    const currentIndex = activeComponent._stateIndex;
+    const currentIndex = instance._stateIndex;
 
     if (states[currentIndex] === undefined) {
         states[currentIndex] = init ? init(initialState) : initialState;
     }
     
     function dispatch(action) {
+        if (instance._unmounted) return;
+        
         const newState = reducer(states[currentIndex], action);
         
         if (Object.is(states[currentIndex], newState)) {
@@ -216,27 +312,34 @@ function useReducer(reducer, initialState, init) {
         scheduleUpdate(() => update());
     }
     
-    activeComponent._stateIndex++;
+    instance._stateIndex++;
     return [states[currentIndex], dispatch];
 }
 
+/**
+ * Hook for side effects
+ * @param {Function} callback - Effect callback
+ * @param {Array} dependencies - Dependency array
+ */
 function useEffect(callback, dependencies) {
     const activeComponent = componentStack[componentStack.length - 1];
     const componentId = getComponentId(activeComponent);
+    const instanceKey = currentInstanceKey;
     
-    activeComponentIds.add(componentId);
+    activeComponentIds.add(instanceKey);
     
-    if (!componentEffects.has(componentId)) {
-        componentEffects.set(componentId, []);
+    if (!componentEffects.has(instanceKey)) {
+        componentEffects.set(instanceKey, []);
     }
     
-    const effects = componentEffects.get(componentId);
+    const effects = componentEffects.get(instanceKey);
+    const instance = componentInstances.get(instanceKey);
     
-    if (!activeComponent._effectIndex) {
-        activeComponent._effectIndex = 0;
+    if (!instance._effectIndex) {
+        instance._effectIndex = 0;
     }
     
-    const currentIndex = activeComponent._effectIndex;
+    const currentIndex = instance._effectIndex;
     const prevEffect = effects[currentIndex];
     
     const shouldRun = shouldRunEffect(prevEffect, dependencies);
@@ -249,48 +352,66 @@ function useEffect(callback, dependencies) {
     };
     
     if (shouldRun) {
-        setTimeout(() => {
-            // Run cleanup from previous effect
+        const timeoutId = setTimeout(() => {
+            if (instance._unmounted || !activeComponentIds.has(instanceKey)) {
+                return;
+            }
+            
             if (prevEffect?.cleanup) {
                 try {
                     prevEffect.cleanup();
                 } catch (e) {
-                    console.error('Error in effect cleanup:', e);
+                    if (DEBUG_MODE) {
+                        console.error('Error in effect cleanup:', e);
+                    }
                 }
             }
             
-            // Run new effect and store cleanup
             try {
                 const cleanup = callback();
                 if (typeof cleanup === 'function') {
                     effects[currentIndex].cleanup = cleanup;
                 }
             } catch (e) {
-                console.error('Error in effect:', e);
+                if (DEBUG_MODE) {
+                    console.error('Error in effect:', e);
+                }
             }
         }, 0);
+        
+        if (!instance._timeouts) {
+            instance._timeouts = [];
+        }
+        instance._timeouts.push(timeoutId);
     }
     
-    activeComponent._effectIndex++;
+    instance._effectIndex++;
 }
 
+/**
+ * Hook for synchronous layout effects
+ * @param {Function} callback - Effect callback
+ * @param {Array} dependencies - Dependency array
+ */
 function useLayoutEffect(callback, dependencies) {
     const activeComponent = componentStack[componentStack.length - 1];
     const componentId = getComponentId(activeComponent);
+    const instanceKey = currentInstanceKey;
     
-    activeComponentIds.add(componentId);
+    activeComponentIds.add(instanceKey);
     
-    if (!componentEffects.has(componentId)) {
-        componentEffects.set(componentId, []);
+    if (!componentEffects.has(instanceKey)) {
+        componentEffects.set(instanceKey, []);
     }
     
-    const effects = componentEffects.get(componentId);
+    const effects = componentEffects.get(instanceKey);
+    const instance = componentInstances.get(instanceKey);
     
-    if (!activeComponent._effectIndex) {
-        activeComponent._effectIndex = 0;
+    if (!instance._effectIndex) {
+        instance._effectIndex = 0;
     }
     
-    const currentIndex = activeComponent._effectIndex;
+    const currentIndex = instance._effectIndex;
     const prevEffect = effects[currentIndex];
     
     const shouldRun = shouldRunEffect(prevEffect, dependencies);
@@ -303,12 +424,17 @@ function useLayoutEffect(callback, dependencies) {
     };
     
     if (shouldRun) {
-        // Synchronous execution
+        if (instance._unmounted || !activeComponentIds.has(instanceKey)) {
+            return;
+        }
+        
         if (prevEffect?.cleanup) {
             try {
                 prevEffect.cleanup();
             } catch (e) {
-                console.error('Error in layout effect cleanup:', e);
+                if (DEBUG_MODE) {
+                    console.error('Error in layout effect cleanup:', e);
+                }
             }
         }
         
@@ -318,33 +444,42 @@ function useLayoutEffect(callback, dependencies) {
                 effects[currentIndex].cleanup = cleanup;
             }
         } catch (e) {
-            console.error('Error in layout effect:', e);
+            if (DEBUG_MODE) {
+                console.error('Error in layout effect:', e);
+            }
         }
     }
     
-    activeComponent._effectIndex++;
+    instance._effectIndex++;
 }
 
+/**
+ * Hook for memoizing expensive computations
+ * @param {Function} factory - Factory function
+ * @param {Array} dependencies - Dependency array
+ * @returns {*} Memoized value
+ */
 function useMemo(factory, dependencies) {
     const activeComponent = componentStack[componentStack.length - 1];
     const componentId = getComponentId(activeComponent);
+    const instanceKey = currentInstanceKey;
     
-    activeComponentIds.add(componentId);
+    activeComponentIds.add(instanceKey);
     
-    if (!componentMemos.has(componentId)) {
-        componentMemos.set(componentId, []);
+    if (!componentMemos.has(instanceKey)) {
+        componentMemos.set(instanceKey, []);
     }
     
-    const memos = componentMemos.get(componentId);
+    const memos = componentMemos.get(instanceKey);
+    const instance = componentInstances.get(instanceKey);
     
-    if (!activeComponent._memoIndex) {
-        activeComponent._memoIndex = 0;
+    if (!instance._memoIndex) {
+        instance._memoIndex = 0;
     }
     
-    const currentIndex = activeComponent._memoIndex;
+    const currentIndex = instance._memoIndex;
     const prevMemo = memos[currentIndex];
     
-    // Check if we need to recompute
     const shouldRecompute = !prevMemo || 
         !dependencies || 
         dependencies.some((dep, i) => !Object.is(dep, prevMemo.dependencies[i]));
@@ -357,10 +492,16 @@ function useMemo(factory, dependencies) {
         };
     }
     
-    activeComponent._memoIndex++;
+    instance._memoIndex++;
     return memos[currentIndex].value;
 }
 
+/**
+ * Hook for memoizing callback functions
+ * @param {Function} callback - Callback function
+ * @param {Array} dependencies - Dependency array
+ * @returns {Function} Memoized callback
+ */
 function useCallback(callback, dependencies) {
     return useMemo(() => callback, dependencies);
 }
@@ -381,29 +522,36 @@ function shouldRunEffect(prevEffect, dependencies) {
     return dependencies.some((dep, i) => !Object.is(dep, prevEffect.dependencies[i]));
 }
 
+/**
+ * Hook for creating a mutable ref object
+ * @param {*} initialValue - Initial ref value
+ * @returns {Object} Ref object with current property
+ */
 function useRef(initialValue) {
     const activeComponent = componentStack[componentStack.length - 1];
     const componentId = getComponentId(activeComponent);
+    const instanceKey = currentInstanceKey;
     
-    activeComponentIds.add(componentId);
+    activeComponentIds.add(instanceKey);
     
-    if (!componentStates.has(componentId)) {
-        componentStates.set(componentId, []);
+    if (!componentStates.has(instanceKey)) {
+        componentStates.set(instanceKey, []);
     }
     
-    const states = componentStates.get(componentId);
+    const states = componentStates.get(instanceKey);
+    const instance = componentInstances.get(instanceKey);
     
-    if (!activeComponent._stateIndex) {
-        activeComponent._stateIndex = 0;
+    if (!instance._stateIndex) {
+        instance._stateIndex = 0;
     }
     
-    const currentIndex = activeComponent._stateIndex;
+    const currentIndex = instance._stateIndex;
 
     if (states[currentIndex] === undefined) {
         states[currentIndex] = { current: initialValue };
     }
     
-    activeComponent._stateIndex++;
+    instance._stateIndex++;
     return states[currentIndex];
 }
 
@@ -411,16 +559,47 @@ function useRef(initialValue) {
 // Lifecycle Helpers
 // ============================================================================
 
+/**
+ * Helper to run callback on component mount
+ * @param {Function} callback - Mount callback
+ */
 function onMount(callback) {
     useEffect(() => {
         callback();
     }, []);
 }
 
+/**
+ * Helper to run callback on component unmount
+ * @param {Function} callback - Unmount callback
+ */
 function onUnmount(callback) {
     useEffect(() => {
         return callback;
     }, []);
+}
+
+// ============================================================================
+// Error Boundary
+// ============================================================================
+
+/**
+ * Wraps a component with error handling
+ * @param {Function} Component - Component to wrap
+ * @param {Function} FallbackComponent - Fallback component for errors
+ * @returns {Function} Wrapped component
+ */
+function withErrorBoundary(Component, FallbackComponent) {
+    return function(props) {
+        try {
+            return Component(props);
+        } catch (error) {
+            if (DEBUG_MODE) {
+                console.error('Error in component rendering:', error);
+            }
+            return FallbackComponent({ error });
+        }
+    };
 }
 
 // ============================================================================
@@ -436,15 +615,31 @@ function createVNode(type, props, children) {
     };
 }
 
-function createComponent(fn) {
+function createComponent(fn, key) {
     return function(...args) {
         const componentId = getComponentId(fn);
-        activeComponentIds.add(componentId);
+        const instanceKey = getInstanceKey(componentId, key);
+        
+        if (!componentInstances.has(instanceKey)) {
+            componentInstances.set(instanceKey, {
+                _stateIndex: 0,
+                _effectIndex: 0,
+                _memoIndex: 0,
+                _unmounted: false,
+                _timeouts: []
+            });
+        }
+        
+        const instance = componentInstances.get(instanceKey);
+        instance._stateIndex = 0;
+        instance._effectIndex = 0;
+        instance._memoIndex = 0;
+        
+        activeComponentIds.add(instanceKey);
         componentStack.push(fn);
         
-        fn._stateIndex = 0;
-        fn._effectIndex = 0;
-        fn._memoIndex = 0;
+        const previousInstanceKey = currentInstanceKey;
+        currentInstanceKey = instanceKey;
         
         const contextStackLength = contextStack.length;
         
@@ -452,12 +647,20 @@ function createComponent(fn) {
         
         contextStack.length = contextStackLength;
         
+        currentInstanceKey = previousInstanceKey;
         componentStack.pop();
         
         return result;
     };
 }
 
+/**
+ * Creates a virtual DOM node (hyperscript)
+ * @param {string} tag - HTML tag name
+ * @param {Object} props - Element properties
+ * @param {...*} children - Child elements
+ * @returns {Object} Virtual DOM node
+ */
 function h(tag, props, ...children) {
     const flatChildren = children
         .flat(Infinity)
@@ -520,7 +723,15 @@ function updateProps(domElement, oldProps, newProps) {
         if (key in newProps || key === "key") continue;
         
         if (key.startsWith("on")) {
-            domElement[key.toLowerCase()] = null;
+            const eventName = key.slice(2).toLowerCase();
+            
+            if (delegatedEvents.has(eventName)) {
+                if (domElement.__listeners) {
+                    delete domElement.__listeners[eventName];
+                }
+            } else {
+                domElement[key.toLowerCase()] = null;
+            }
         } else if (key === "className") {
             domElement.className = "";
         } else {
@@ -532,7 +743,16 @@ function updateProps(domElement, oldProps, newProps) {
         if (key === "key" || oldProps[key] === newProps[key]) continue;
         
         if (key.startsWith("on") && typeof newProps[key] === "function") {
-            domElement[key.toLowerCase()] = newProps[key];
+            const eventName = key.slice(2).toLowerCase();
+            
+            if (delegatedEvents.has(eventName)) {
+                if (!domElement.__listeners) {
+                    domElement.__listeners = {};
+                }
+                domElement.__listeners[eventName] = newProps[key];
+            } else {
+                domElement[key.toLowerCase()] = newProps[key];
+            }
         } else if (key === "className") {
             domElement.className = newProps[key];
         } else {
@@ -584,12 +804,10 @@ function diff(parentDom, oldVNode, newVNode, index = 0) {
         updateProps(domNode, oldVNode.props, newVNode.props);
     }
     
-    // Keyed diffing for children
     diffChildren(domNode, oldVNode.children || [], newVNode.children || []);
 }
 
 function diffChildren(parentDom, oldChildren, newChildren) {
-    // Build maps for keyed children
     const oldKeyedChildren = new Map();
     const oldIndexedChildren = [];
     
@@ -607,14 +825,12 @@ function diffChildren(parentDom, oldChildren, newChildren) {
         let oldChild = null;
         let oldIndex = -1;
         
-        // Try to match by key first
         if (newChild.key != null && oldKeyedChildren.has(newChild.key)) {
             const match = oldKeyedChildren.get(newChild.key);
             oldChild = match.child;
             oldIndex = match.index;
             oldKeyedChildren.delete(newChild.key);
         }
-        // Fallback to positional matching for non-keyed children
         else if (newChild.key == null && oldIndexPointer < oldIndexedChildren.length) {
             const match = oldIndexedChildren[oldIndexPointer];
             oldChild = match.child;
@@ -623,10 +839,8 @@ function diffChildren(parentDom, oldChildren, newChildren) {
         }
         
         if (oldChild) {
-            // Update existing child
             diff(parentDom, oldChild, newChild, newIndex);
             
-            // Move DOM node if position changed
             const currentDom = domNodeMap.get(newChild);
             const expectedDom = parentDom.childNodes[newIndex];
             
@@ -634,14 +848,12 @@ function diffChildren(parentDom, oldChildren, newChildren) {
                 parentDom.insertBefore(currentDom, expectedDom || null);
             }
         } else {
-            // Insert new child
             const newDom = createDOMElement(newChild);
             const refNode = parentDom.childNodes[newIndex] || null;
             parentDom.insertBefore(newDom, refNode);
         }
     });
     
-    // Remove unused keyed children
     oldKeyedChildren.forEach(({ child }) => {
         const domNode = domNodeMap.get(child);
         if (domNode?.parentNode) {
@@ -649,7 +861,6 @@ function diffChildren(parentDom, oldChildren, newChildren) {
         }
     });
     
-    // Remove extra indexed children
     for (let i = oldIndexPointer; i < oldIndexedChildren.length; i++) {
         const { child } = oldIndexedChildren[i];
         const domNode = domNodeMap.get(child);
@@ -663,26 +874,37 @@ function diffChildren(parentDom, oldChildren, newChildren) {
 // Component Cleanup
 // ============================================================================
 
-function cleanupComponent(componentId) {
-    // Run all effect cleanups
-    const effects = componentEffects.get(componentId);
+function cleanupComponent(instanceKey) {
+    const instance = componentInstances.get(instanceKey);
+    if (!instance) return;
+    
+    instance._unmounted = true;
+    
+    if (instance._timeouts) {
+        instance._timeouts.forEach(id => clearTimeout(id));
+        instance._timeouts = [];
+    }
+    
+    const effects = componentEffects.get(instanceKey);
     if (effects) {
         effects.forEach(effect => {
             if (effect?.cleanup) {
                 try {
                     effect.cleanup();
                 } catch (e) {
-                    console.error('Error in cleanup:', e);
+                    if (DEBUG_MODE) {
+                        console.error('Error in cleanup:', e);
+                    }
                 }
             }
         });
     }
     
-    // Clear component data
-    componentStates.delete(componentId);
-    componentEffects.delete(componentId);
-    componentMemos.delete(componentId);
-    componentCallbacks.delete(componentId);
+    componentStates.delete(instanceKey);
+    componentEffects.delete(instanceKey);
+    componentMemos.delete(instanceKey);
+    componentCallbacks.delete(instanceKey);
+    componentInstances.delete(instanceKey);
 }
 
 // ============================================================================
@@ -706,7 +928,6 @@ function update() {
     
     oldVTree = newVTree;
     
-    // Cleanup unmounted components
     for (const id of previousActiveIds) {
         if (!activeComponentIds.has(id)) {
             cleanupComponent(id);
@@ -722,6 +943,34 @@ function render(comp) {
     const newVTree = createComponent(comp)();
     root.appendChild(createDOMElement(newVTree));
     oldVTree = newVTree;
+}
+
+/**
+ * Creates a root for rendering
+ * @param {HTMLElement} container - DOM container element
+ * @returns {Object} Root object with render method
+ */
+function createRoot(container) {
+    if (!container || !(container instanceof HTMLElement)) {
+        throw new Error('createRoot requires a valid DOM element');
+    }
+    
+    initEventDelegation();
+    
+    return {
+        render(comp) {
+            root = container;
+            component = comp;
+            activeComponentIds.clear();
+            contextStack.length = 0;
+            
+            container.innerHTML = "";
+            
+            const newVTree = createComponent(comp)();
+            container.appendChild(createDOMElement(newVTree));
+            oldVTree = newVTree;
+        }
+    };
 }
 
 // ============================================================================
@@ -778,3 +1027,35 @@ const {
     form, fieldset, legend, label, input, button, select, datalist, optgroup,
     option, textarea, output, details, summary, dialog, menu, menuitem, svg, path
 } = elements;
+
+// ============================================================================
+// Version and Global Exports
+// ============================================================================
+
+const MyReact = {
+    version: "1.0.0",
+    createRoot,
+    render,
+    h,
+    useState,
+    useReducer,
+    useEffect,
+    useLayoutEffect,
+    useMemo,
+    useCallback,
+    useRef,
+    useContext,
+    createContext,
+    onMount,
+    onUnmount,
+    withErrorBoundary,
+    DEBUG_MODE,
+    setDebugMode: (enabled) => { DEBUG_MODE = enabled; },
+    // HTML helpers
+    ...elements
+};
+
+// Export for browser environment
+if (typeof window !== 'undefined') {
+    window.MyReact = MyReact;
+}
